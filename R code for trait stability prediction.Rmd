@@ -1,0 +1,249 @@
+---
+title: "R codes for trait stability"
+author: "Paul Adunola"
+date: "2023-02-22"
+output: html_document
+---
+
+## Required R Packages
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+
+library(dplyr)
+library(BGLR)
+library(metan)
+library(FW)
+```
+
+## Overview
+
+This codes describe the step used for predicting yield stability in two coffee populations. The first step involves stability estimate from Additive Main-Effect and Multiplicative Interaction (AMMI) model and Finlay-Wilkinson regression (FW) model. The second step involves implementing three statistical approaches to test how multi-population data could be integrated to better predict trait stability. Single population (SP), across population (AP) and mulitple population (MP) models were fitted as described by [Lopez-Cruz et al. (2015)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4390573/). The codes for the AP- and MP-GS models were adapted from [de los Campos BGLR-R](https://github.com/gdlc/BGLR-R/blob/master/inst/md/heterogeneity_interactions.md).
+
+Phenotypic file contains yield data for two populations: Premature (Prec) and Intermediate (Inter). Both populations differ by coffee bean maturity date, `Prec` mature earlier than `Inter` population. Genotypic file contains imputed ~56k snps for both populations. 
+
+## Load data
+
+The file1.RData file contain the phenotype and genotype files
+
+```{r}
+load("file1.RData", verbose = T)
+```
+
+## Stability Estimate
+
+Estimate of stability for genotypes in premature and intermediate populations were obtained from AMMI and FW models.
+
+### AMMI
+
+```{r}
+
+#Merge year and location
+
+Prec_pop_y$ENV = paste(Prec_pop_y$year,Prec_pop_y$location,sep = "_")
+Inter_pop_y$ENV = paste(Inter_pop_y$year,Inter_pop_y$location,sep = "_")
+
+#Prec
+Prec_ge = Prec_pop_y%>%
+  group_by(trat,
+           block,
+           ENV)%>%
+  summarise(Yield=mean(Yield,na.rm=T))%>%
+  as.data.frame()
+Yieldp_ammi=Prec_ge%>%waas(ENV, trat, block, resp=Yield)%>%AMMI_indexes()
+asi_p = data.frame(Yieldp_ammi$Yield[,c(1,10)])
+
+#Inter
+Inter_ge = Inter_pop_y%>%
+  group_by(trat,
+           block,
+           ENV)%>%
+  summarise(Yield=mean(Yield,na.rm=T))%>%
+  as.data.frame()
+
+Yieldi_ammi=Inter_ge%>%waas(ENV, trat, block, resp=Yield)%>%AMMI_indexes()
+asi_i = data.frame(Yieldi_ammi$Yield[,c(1,10)])
+
+```
+
+### FW
+
+```{r}
+
+#Prec
+
+Prec_gem=Prec_ge%>%
+  group_by(trat,ENV)%>%
+  summarise(Yield=mean(Yield,na.rm=T))%>%
+  as.data.frame()
+Yieldp_fw=FW(y=Prec_gem$Yield, VAR=Prec_gem$trat, ENV = Prec_gem$ENV, method = "OLS")
+fwbp=data.frame("trat"=Yieldp_fw$VARlevels,"FW"=Yieldp_fw$b)
+
+#Inter
+Inter_gem=Inter_ge%>%
+  group_by(trat,ENV)%>%
+  summarise(Yield=mean(Yield,na.rm=T))%>%
+  as.data.frame()
+
+Yieldi_fw=FW(y=Inter_gem$Yield, VAR=Inter_gem$trat, ENV = Inter_gem$ENV,method = "OLS")
+
+fwbi=data.frame("trat"=Yieldi_fw$VARlevels,"FW"=Yieldi_fw$b)
+
+```
+
+### Reorder data
+
+```{r}
+#Matching Genotype name to marker arrangement
+asi_p2 = asi_p[match(fwbp$trat,asi_p$GEN),]
+asi_i2 = asi_i[match(fwbi$trat,asi_i$GEN),]
+asi_p2 = data.frame(asi_p2,fwbp[,2])
+asi_i2 = data.frame(asi_i2,fwbi[,2])
+names(asi_i2)[c(1,3)] = c("trat","FW"); names(asi_p2)[c(1,3)] = c("trat","FW")
+
+si_p3=asi_p2[match(snp_arr_Combined$V[1:103],(asi_p2$trat)),]
+si_i3=asi_i2[match(snp_arr_Combined$V[104:221]-200,(asi_i2$trat)),]
+
+joint.asi=rbind.data.frame(si_p3,si_i3)
+```
+
+## Genomic Prediction
+
+SNP Clustering and preparation of GS model inputs
+
+```{r}
+
+#Clustering
+X2=scale(snpj_imputed)/sqrt(ncol(snpj_imputed))
+#Clustering PCs
+PC=svd(X2,nu=2,nv=0)$u
+group=kmeans(x=PC,centers=2,nstart=100)$cluster
+
+#Preparing inputs
+X00=X2 # for main effects
+X11=X2; X11[group==2,]=0 #interactions
+X22=X2; X22[group==1,]=0 #interactions
+
+```
+
+### Single Population Model
+
+```{r}
+
+sp_gs = function(y,snp_file,nIter=30,burnIn=5,model='BRR'){
+  
+  seed=sample(1:1e4,5)
+  rep_r2 = list();
+  for (i in 1:5) {
+    set.seed(seed[i])
+    print(i)
+    n = length(y)
+    folds=sample(1:10,size=n,replace=T)
+    
+    r2 = vector()
+    for (j in 1:max(folds)) {
+      tst2=which(folds==i)
+      yNA=y
+      yNA[tst2]=NA
+      
+      fm0 = BGLR(y=yNA,ETA=list(g=list(X=snp_file,model=model)),
+                  nIter=nIter,burnIn=burnIn,verbose = FALSE)
+      y_pred=fm0$yHat[tst2]
+      r2[j]=cor(y_pred,y[tst2],use="complete") #Correlation
+      
+    }
+    rep_r2[[i]] = r2
+  }
+  return(rep_r2)
+}
+
+#Ammi
+asi_p_sp = sp_gs(si_p3$ASV,prec_snp)
+mean(unlist(asi_p_sp))
+asi_i_sp = sp_gs(si_i3$ASV,inter_snp)
+mean(unlist(asi_i_sp))
+#FW
+fw_p_sp = sp_gs(si_p3$FW,prec_snp)
+mean(unlist(fw_p_sp))
+fw_i_sp = sp_gs(si_i3$FW,inter_snp)
+mean(unlist(fw_i_sp))
+
+
+```
+
+### Across Population Model
+
+```{r}
+ap_gs = function(y,X00,nIter=30,burnIn=5){
+  
+  seed=sample(1:1e4,5)
+  rep_r2 = list();
+  for (i in 1:5) {
+    set.seed(seed[i])
+    print(i)
+    n = length(y)
+    folds=sample(1:10,size=n,replace=T)
+    
+    r2 = vector()
+    for (j in 1:max(folds)) {
+      tst2=which(folds==i)
+      yNA=y
+      yNA[tst2]=NA
+      
+      fm0 = BGLR(y=yNA,ETA=list(list(X=X00,model='BRR')),
+                 nIter=nIter,burnIn=burnIn,verbose = FALSE)
+      y_pred=fm0$yHat[tst2]
+      r2[j]=cor(y_pred,y[tst2],use="complete") #Correlation
+    }
+    rep_r2[[i]] = r2
+  }
+  return(rep_r2)
+}
+
+#Ammi
+asi_ap = ap_gs(joint.asi$ASV,X00)
+mean(unlist(asi_ap))
+#FW
+fw_ap = ap_gs(joint.asi$FW,X00)
+mean(unlist(fw_ap))
+
+```
+
+### Multiple Population Model
+
+```{r}
+mp_gs = function(y,X00,X11,X22,nIter=30,burnIn=5){
+  
+  seed=sample(1:1e4,5)
+  rep_r2 = list();
+  for (i in 1:5) {
+    set.seed(seed[i])
+    print(i)
+    n = length(y)
+    folds=sample(1:10,size=n,replace=T)
+    
+    r2 = vector()
+    for (j in 1:max(folds)) {
+      tst2=which(folds==i)
+      yNA=y
+      yNA[tst2]=NA
+      
+      fm0 = BGLR(y=yNA,ETA=list(main=list(X=X00,model='BRR'),
+                                int1=list(X=X11,model='BRR'),int2=list(X=X22,model='BRR')),
+                 nIter=nIter,burnIn=burnIn,verbose = FALSE)
+      y_pred=fm0$yHat[tst2]
+      r2[j]=cor(y_pred,y[tst2],use="complete") #Correlation
+    }
+    rep_r2[[i]] = r2
+  }
+  return(rep_r2)
+}
+
+#Ammi
+asi_mp = mp_gs(joint.asi$ASV,X00,X11,X22)
+mean(unlist(asi_mp))
+#FW
+fw_mp = mp_gs(joint.asi$FW,X00,X11,X22)
+mean(unlist(fw_mp))
+
+```
+
